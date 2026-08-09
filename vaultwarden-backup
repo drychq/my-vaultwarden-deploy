@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_DIR="/opt/vaultwarden"
+DATA_DIR="$APP_DIR/vw-data"
+DEFAULT_BACKUP_DIR="$APP_DIR/backups"
+LOCK_FILE="/run/lock/vaultwarden-maintenance.lock"
+
+usage() {
+  cat <<'USAGE'
+用法：
+  sudo vaultwarden-backup [--online|--cold] [--keep 天数] [--output 目录]
+
+说明：
+  --online  使用 SQLite 在线备份接口，基本无停机；默认模式。
+  --cold    短暂停止 Vaultwarden 后完整复制，适合更新前或手工维护前。
+  --keep    删除超过指定天数的本地备份；默认 14。
+USAGE
+}
+
+require_root() {
+  [[ ${EUID} -eq 0 ]] || { echo "错误：请使用 sudo 执行。" >&2; exit 1; }
+}
+
+main() {
+  require_root
+  [[ -f $APP_DIR/compose.yaml && -d $DATA_DIR ]] || {
+    echo "错误：未发现 Vaultwarden 部署。" >&2
+    exit 1
+  }
+
+  local mode="online" keep_days=14 backup_dir="$DEFAULT_BACKUP_DIR"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --online) mode="online"; shift ;;
+      --cold) mode="cold"; shift ;;
+      --keep) keep_days=${2:?缺少天数}; shift 2 ;;
+      --output) backup_dir=${2:?缺少目录}; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) echo "错误：未知参数 $1" >&2; usage; exit 2 ;;
+    esac
+  done
+
+  [[ $keep_days =~ ^[0-9]+$ ]] || { echo "错误：--keep 必须是非负整数。" >&2; exit 2; }
+
+  if [[ ${VW_LOCK_HELD:-0} != "1" ]]; then
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || { echo "错误：另一个 Vaultwarden 维护任务正在运行。" >&2; exit 1; }
+  fi
+
+  install -d -m 0700 "$backup_dir"
+  local ts stage archive_tmp archive stopped=0
+  ts=$(date '+%Y%m%d-%H%M%S')
+  stage=$(mktemp -d "$backup_dir/.staging-${ts}-XXXXXX")
+  archive="$backup_dir/vaultwarden-backup-${ts}-${mode}.tar.gz"
+  archive_tmp="${archive}.tmp"
+
+  cleanup() {
+    local rc=$?
+    rm -rf "$stage" "$archive_tmp"
+    if [[ $stopped -eq 1 ]]; then
+      (cd "$APP_DIR" && docker compose start vaultwarden >/dev/null) || true
+    fi
+    exit "$rc"
+  }
+  trap cleanup EXIT INT TERM
+
+  install -d -m 0700 "$stage/vw-data" "$stage/deployment"
+
+  cd "$APP_DIR"
+  if [[ $mode == "cold" ]]; then
+    if docker inspect -f '{{.State.Running}}' vaultwarden 2>/dev/null | grep -qx true; then
+      docker compose stop vaultwarden >/dev/null
+      stopped=1
+    fi
+    cp -a "$DATA_DIR"/. "$stage/vw-data"/
+  else
+    cp -a "$DATA_DIR"/. "$stage/vw-data"/
+    rm -f "$stage/vw-data/db.sqlite3" "$stage/vw-data/db.sqlite3-wal" "$stage/vw-data/db.sqlite3-shm"
+    if [[ -f $DATA_DIR/db.sqlite3 ]]; then
+      sqlite3 "$DATA_DIR/db.sqlite3" ".backup '$stage/vw-data/db.sqlite3'"
+    fi
+  fi
+
+  cp -a "$APP_DIR/.env" "$APP_DIR/compose.yaml" "$APP_DIR/Caddyfile" "$stage/deployment"/
+
+  {
+    echo "created_at=$(date --iso-8601=seconds)"
+    echo "backup_mode=$mode"
+    echo "hostname=$(hostname -f 2>/dev/null || hostname)"
+    docker inspect -f 'vaultwarden_image={{.Config.Image}} image_id={{.Image}}' vaultwarden 2>/dev/null || true
+    docker inspect -f 'caddy_image={{.Config.Image}} image_id={{.Image}}' vaultwarden-caddy 2>/dev/null || true
+  } > "$stage/metadata.txt"
+
+  if [[ -f $stage/vw-data/db.sqlite3 ]]; then
+    local integrity
+    integrity=$(sqlite3 "$stage/vw-data/db.sqlite3" 'PRAGMA integrity_check;')
+    [[ $integrity == "ok" ]] || {
+      echo "错误：备份数据库完整性检查失败：$integrity" >&2
+      exit 1
+    }
+  fi
+
+  tar --numeric-owner -C "$stage" -czf "$archive_tmp" .
+  chmod 0600 "$archive_tmp"
+  mv "$archive_tmp" "$archive"
+
+  if [[ $stopped -eq 1 ]]; then
+    docker compose start vaultwarden >/dev/null
+    stopped=0
+  fi
+
+  find "$backup_dir" -maxdepth 1 -type f -name 'vaultwarden-backup-*.tar.gz' \
+    -mtime "+${keep_days}" -delete
+
+  trap - EXIT INT TERM
+  rm -rf "$stage"
+  echo "$archive"
+}
+
+main "$@"

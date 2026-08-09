@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_DIR="/opt/vaultwarden"
+ENV_FILE="$APP_DIR/.env"
+
+require_root() {
+  [[ ${EUID} -eq 0 ]] || { echo "错误：请使用 sudo 执行。" >&2; exit 1; }
+}
+
+get_env() {
+  local key=$1
+  awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE"
+}
+
+main() {
+  require_root
+  [[ -f $ENV_FILE && -f $APP_DIR/compose.yaml ]] || {
+    echo "错误：未发现 Vaultwarden 部署。" >&2
+    exit 1
+  }
+
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  cd "$APP_DIR"
+
+  echo "== 容器状态 =="
+  docker compose ps
+  echo
+
+  echo "== 关键配置 =="
+  echo "VW_URL=$VW_URL"
+  echo "WEB_VAULT_ENABLED=$(get_env WEB_VAULT_ENABLED)"
+  echo "SIGNUPS_ALLOWED=$(get_env SIGNUPS_ALLOWED)"
+  echo
+
+  echo "== 服务检测 =="
+  if curl -fsS --max-time 10 "${VW_URL}/alive"; then
+    echo
+    echo "HTTPS /alive：正常"
+  else
+    echo "HTTPS /alive：失败"
+  fi
+  echo
+
+  echo "== 镜像 =="
+  docker inspect -f 'Vaultwarden: {{.Config.Image}}  {{.Image}}' vaultwarden 2>/dev/null || true
+  docker inspect -f 'Caddy:       {{.Config.Image}}  {{.Image}}' vaultwarden-caddy 2>/dev/null || true
+  echo
+
+  echo "== TLS 证书 =="
+  timeout 12 openssl s_client -servername "$VW_HOST" -connect "$VW_HOST:443" </dev/null 2>/dev/null \
+    | openssl x509 -noout -subject -issuer -dates 2>/dev/null || echo "无法读取证书。"
+  echo
+
+  echo "== 最近日志 =="
+  docker compose logs --tail=30 vaultwarden caddy
+}
+
+main "$@"

@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_DIR="/opt/vaultwarden"
+ENV_FILE="$APP_DIR/.env"
+CONFIG_JSON="$APP_DIR/vw-data/config.json"
+LOCK_FILE="/run/lock/vaultwarden-maintenance.lock"
+
+usage() {
+  cat <<'USAGE'
+用法：
+  sudo vaultwarden-config [选项]
+
+选项：
+  --web on|off       开启或关闭 Vaultwarden 自带网页端
+  --signups on|off   开启或关闭新用户注册
+  --show             只显示当前状态
+  -h, --help         显示帮助
+
+示例：
+  sudo vaultwarden-config --web on --signups off
+  sudo vaultwarden-config --web off --signups off
+  sudo vaultwarden-config --signups on
+USAGE
+}
+
+require_root() {
+  [[ ${EUID} -eq 0 ]] || { echo "错误：请使用 sudo 执行。" >&2; exit 1; }
+}
+
+normalize_bool() {
+  case "${1,,}" in
+    on|true|1|yes|y) echo "true" ;;
+    off|false|0|no|n) echo "false" ;;
+    *) return 1 ;;
+  esac
+}
+
+get_env() {
+  local key=$1
+  awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE"
+}
+
+set_env() {
+  local key=$1 value=$2 tmp
+  tmp=$(mktemp)
+  awk -v key="$key" -v value="$value" '
+    BEGIN { found=0 }
+    index($0, key "=") == 1 { print key "=" value; found=1; next }
+    { print }
+    END { if (!found) print key "=" value }
+  ' "$ENV_FILE" > "$tmp"
+  install -m 0600 "$tmp" "$ENV_FILE"
+  rm -f "$tmp"
+}
+
+show_status() {
+  local web signups
+  web=$(get_env WEB_VAULT_ENABLED)
+  signups=$(get_env SIGNUPS_ALLOWED)
+  printf 'WEB_VAULT_ENABLED=%s\nSIGNUPS_ALLOWED=%s\n' "$web" "$signups"
+  if [[ -f $CONFIG_JSON ]]; then
+    echo "提示：检测到 config.json；脚本会移除其中对上述两个参数的覆盖，让 .env 成为唯一来源。"
+  fi
+}
+
+main() {
+  require_root
+  [[ -f $ENV_FILE && -f $APP_DIR/compose.yaml ]] || {
+    echo "错误：未发现 $APP_DIR 下的部署。" >&2
+    exit 1
+  }
+
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || { echo "错误：另一个 Vaultwarden 维护任务正在运行。" >&2; exit 1; }
+
+  local web="" signups="" show_only=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --web)
+        [[ $# -ge 2 ]] || { usage; exit 2; }
+        web=$(normalize_bool "$2") || { echo "错误：--web 只能是 on/off。" >&2; exit 2; }
+        shift 2
+        ;;
+      --signups)
+        [[ $# -ge 2 ]] || { usage; exit 2; }
+        signups=$(normalize_bool "$2") || { echo "错误：--signups 只能是 on/off。" >&2; exit 2; }
+        shift 2
+        ;;
+      --show) show_only=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) echo "错误：未知参数 $1" >&2; usage; exit 2 ;;
+    esac
+  done
+
+  if [[ $show_only -eq 1 ]]; then
+    show_status
+    exit 0
+  fi
+
+  if [[ -z $web && -z $signups ]]; then
+    local current_web current_signups answer
+    current_web=$(get_env WEB_VAULT_ENABLED)
+    current_signups=$(get_env SIGNUPS_ALLOWED)
+
+    read -r -p "网页端 [on/off，回车保持 ${current_web}]：" answer
+    if [[ -n $answer ]]; then
+      web=$(normalize_bool "$answer") || { echo "错误：输入无效。" >&2; exit 2; }
+    fi
+
+    read -r -p "允许注册 [on/off，回车保持 ${current_signups}]：" answer
+    if [[ -n $answer ]]; then
+      signups=$(normalize_bool "$answer") || { echo "错误：输入无效。" >&2; exit 2; }
+    fi
+
+    if [[ -z $web && -z $signups ]]; then
+      echo "没有修改。"
+      exit 0
+    fi
+  fi
+
+  local ts env_backup config_backup=""
+  ts=$(date '+%Y%m%d-%H%M%S')
+  env_backup="$APP_DIR/backups/env-before-config-${ts}"
+  cp -a "$ENV_FILE" "$env_backup"
+
+  [[ -n $web ]] && set_env WEB_VAULT_ENABLED "$web"
+  [[ -n $signups ]] && set_env SIGNUPS_ALLOWED "$signups"
+
+  if [[ -f $CONFIG_JSON ]]; then
+    config_backup="$APP_DIR/backups/config-before-config-${ts}.json"
+    cp -a "$CONFIG_JSON" "$config_backup"
+    jq 'del(.web_vault_enabled, .signups_allowed)' "$CONFIG_JSON" > "${CONFIG_JSON}.tmp"
+    install -m 0600 "${CONFIG_JSON}.tmp" "$CONFIG_JSON"
+    rm -f "${CONFIG_JSON}.tmp"
+  fi
+
+  cd "$APP_DIR"
+  if ! docker compose config --quiet; then
+    cp -a "$env_backup" "$ENV_FILE"
+    [[ -n $config_backup ]] && cp -a "$config_backup" "$CONFIG_JSON"
+    echo "错误：Compose 配置校验失败，已回滚配置文件。" >&2
+    exit 1
+  fi
+
+  docker compose up -d --no-deps --force-recreate vaultwarden
+
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  local ready=0 i
+  for i in $(seq 1 30); do
+    if curl -fsS --max-time 5 "${VW_URL}/alive" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 2
+  done
+
+  show_status
+  if [[ $ready -eq 1 ]]; then
+    echo "配置已应用，服务正常。"
+  else
+    echo "警告：配置已应用，但 /alive 检测失败。请执行 sudo vaultwarden-status。" >&2
+    exit 1
+  fi
+
+  if [[ $(get_env SIGNUPS_ALLOWED) == "false" ]]; then
+    echo "注册已在服务端关闭；网页或客户端可能缓存 /api/config，界面变化可能不会立即显示。"
+  fi
+  if [[ $(get_env WEB_VAULT_ENABLED) == "false" ]]; then
+    echo "网页端已关闭，但桌面端、移动端和浏览器扩展仍可通过 API 同步。"
+  fi
+}
+
+main "$@"
