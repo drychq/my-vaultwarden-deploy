@@ -1,0 +1,987 @@
+#!/usr/bin/env bash
+#
+# vaultwardenctl — Vaultwarden 单机部署与运维统一入口(Debian 12/13)
+#
+# 设计原则:
+#   1. 单一配置来源:全部部署参数只存于 /opt/vaultwarden/.env;
+#      compose.yaml 与 Caddyfile 只引用变量,不落盘第二份(如完整 URL 由 VW_HOST 现算派生)。
+#   2. 统一变更流水线:所有配置修改走同一条
+#      备份 → 修改 → 校验 → 重建 → 健康检查 → 失败回滚 的路径。
+#   3. 可扩展:新增可变配置项只需在下方“配置注册表”加一行,
+#      必要时在 validate_value 里补充值类型,无需新写脚本。
+#
+set -Eeuo pipefail
+
+VERSION="2.0.0"
+APP_DIR="/opt/vaultwarden"
+ENV_FILE="$APP_DIR/.env"
+COMPOSE_FILE="$APP_DIR/compose.yaml"
+CADDYFILE="$APP_DIR/Caddyfile"
+DATA_DIR="$APP_DIR/vw-data"
+CONFIG_JSON="$DATA_DIR/config.json"
+BACKUP_DIR="$APP_DIR/backups"
+LOCK_FILE="/run/lock/vaultwarden-maintenance.lock"
+SBIN_PATH="/usr/local/sbin/vaultwardenctl"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+
+# 与 compose.yaml 模板中的镜像保持一致(更新失败回滚时按此打回旧镜像标签)
+VW_IMAGE="vaultwarden/server:latest"
+CADDY_IMAGE="caddy:2"
+
+# ---------------- 配置注册表 ----------------
+# 每个可变配置项:CLI 键名 → .env 变量 / 值类型 / 修改后需重建的服务 / config.json 覆盖键(如有)。
+CFG_ORDER=(domain email web signups)
+declare -A CFG_ENV=(
+  [domain]=VW_HOST
+  [email]=ACME_EMAIL
+  [web]=WEB_VAULT_ENABLED
+  [signups]=SIGNUPS_ALLOWED
+)
+declare -A CFG_TYPE=(
+  [domain]=domain
+  [email]=email
+  [web]=bool
+  [signups]=bool
+)
+declare -A CFG_SVCS=(
+  [domain]="vaultwarden caddy"
+  [email]="caddy"
+  [web]="vaultwarden"
+  [signups]="vaultwarden"
+)
+# 管理后台保存的 config.json 会覆盖环境变量,受管参数在此登记以便修改时清除覆盖
+declare -A CFG_JSON_KEY=(
+  [web]=web_vault_enabled
+  [signups]=signups_allowed
+)
+
+# ---------------- 基础工具 ----------------
+
+info() { echo "$*" >&2; }
+warn() { echo "警告:$*" >&2; }
+die()  { echo "错误:$*" >&2; exit 1; }
+
+require_root() {
+  [[ ${EUID} -eq 0 ]] || die "请使用 sudo 或 root 执行。"
+}
+
+require_deployment() {
+  [[ -f $ENV_FILE && -f $COMPOSE_FILE ]] || die "未发现 $APP_DIR 下的 Vaultwarden 部署。"
+}
+
+LOCK_HELD=0
+acquire_lock() {
+  if [[ $LOCK_HELD -eq 1 ]]; then
+    return 0
+  fi
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "另一个 Vaultwarden 维护任务正在运行。"
+  LOCK_HELD=1
+}
+
+compose() {
+  docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
+}
+
+get_env() {
+  awk -F= -v key="$1" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$ENV_FILE"
+}
+
+set_env() {
+  local key=$1 value=$2 tmp
+  tmp=$(mktemp)
+  awk -F= -v key="$key" -v value="$value" '
+    $1 == key { print key "=" value; found=1; next }
+    { print }
+    END { if (!found) print key "=" value }
+  ' "$ENV_FILE" > "$tmp"
+  install -m 0600 "$tmp" "$ENV_FILE"
+  rm -f "$tmp"
+}
+
+vw_url() {
+  echo "https://$(get_env VW_HOST)"
+}
+
+wait_alive() {
+  local url=$1 attempts=${2:-45}
+  for _ in $(seq 1 "$attempts"); do
+    if curl -fsS --max-time 5 "${url}/alive" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+normalize_bool() {
+  case "${1,,}" in
+    on|true|1|yes|y) echo "true" ;;
+    off|false|0|no|n) echo "false" ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_domain_format() {
+  [[ $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
+}
+
+validate_email_format() {
+  [[ $1 =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]
+}
+
+strip_domain() {
+  local value=$1
+  value=${value#http://}
+  value=${value#https://}
+  value=${value%/}
+  echo "$value"
+}
+
+# 按注册表类型校验并规范化配置值;stdout 输出规范化结果,非法则返回 1
+validate_value() {
+  local key=$1 raw=$2 value
+  case "${CFG_TYPE[$key]}" in
+    bool)
+      normalize_bool "$raw"
+      ;;
+    domain)
+      value=$(strip_domain "$raw")
+      validate_domain_format "$value" || return 1
+      echo "$value"
+      ;;
+    email)
+      validate_email_format "$raw" || return 1
+      echo "$raw"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# ---------------- 配置文件模板 ----------------
+
+write_env_file() {
+  local domain=$1 email=$2
+  cat > "$ENV_FILE" <<ENV
+# Vaultwarden 部署配置——唯一配置来源。
+# 请通过 vaultwardenctl config set 修改,避免手工编辑。
+VW_HOST=${domain}
+ACME_EMAIL=${email}
+WEB_VAULT_ENABLED=true
+SIGNUPS_ALLOWED=true
+ENV
+  chmod 0600 "$ENV_FILE"
+}
+
+write_compose_file() {
+  cat > "$COMPOSE_FILE" <<'COMPOSE'
+name: vaultwarden
+
+services:
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    restart: unless-stopped
+    environment:
+      DOMAIN: "https://${VW_HOST}"
+      WEB_VAULT_ENABLED: "${WEB_VAULT_ENABLED}"
+      SIGNUPS_ALLOWED: "${SIGNUPS_ALLOWED}"
+      INVITATIONS_ALLOWED: "false"
+      SHOW_PASSWORD_HINT: "false"
+      IP_HEADER: "X-Real-IP"
+      LOG_LEVEL: "info"
+    volumes:
+      - ./vw-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  caddy:
+    image: caddy:2
+    container_name: vaultwarden-caddy
+    restart: unless-stopped
+    depends_on:
+      - vaultwarden
+    environment:
+      VW_HOST: "${VW_HOST}"
+      ACME_EMAIL: "${ACME_EMAIL}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy-data:/data
+      - ./caddy-config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+COMPOSE
+  chmod 0600 "$COMPOSE_FILE"
+}
+
+write_caddyfile() {
+  cat > "$CADDYFILE" <<'CADDY'
+{
+    email {$ACME_EMAIL}
+}
+
+{$VW_HOST} {
+    encode zstd gzip
+
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "same-origin"
+        -Server
+    }
+
+    reverse_proxy vaultwarden:80 {
+        header_up X-Real-IP {remote_host}
+    }
+}
+CADDY
+  chmod 0600 "$CADDYFILE"
+}
+
+caddy_validate() {
+  compose run --rm --no-deps --entrypoint caddy caddy \
+    validate --config /etc/caddy/Caddyfile --adapter caddyfile
+}
+
+install_self() {
+  if [[ $SELF != "$SBIN_PATH" ]]; then
+    install -m 0750 "$SELF" "$SBIN_PATH"
+    info "已安装管理命令:$SBIN_PATH"
+  fi
+}
+
+install_backup_timer() {
+  cat > /etc/systemd/system/vaultwarden-backup.service <<SERVICE
+[Unit]
+Description=Vaultwarden local backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=${SBIN_PATH} backup --online --keep 14
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+SERVICE
+
+  cat > /etc/systemd/system/vaultwarden-backup.timer <<'TIMER'
+[Unit]
+Description=Daily Vaultwarden local backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+  systemctl daemon-reload
+  systemctl enable --now vaultwarden-backup.timer
+}
+
+install_docker() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y ca-certificates curl gnupg jq sqlite3 tar gzip unzip openssl iproute2 util-linux
+
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    info "Docker Engine 与 Compose 已存在,跳过安装。"
+    systemctl enable --now docker
+    return 0
+  fi
+
+  info "安装 Docker 官方仓库版本……"
+  apt-get remove -y docker.io docker-compose docker-doc podman-docker containerd runc 2>/dev/null || true
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  cat > /etc/apt/sources.list.d/docker.sources <<DOCKER_REPO
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: ${VERSION_CODENAME}
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+DOCKER_REPO
+
+  apt-get update
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker
+}
+
+check_ports() {
+  local listeners
+  listeners=$(ss -ltnH 2>/dev/null | awk '$4 ~ /:80$/ || $4 ~ /:443$/ {print}' || true)
+  if [[ -n $listeners ]]; then
+    echo "错误:80 或 443 端口已被占用:" >&2
+    echo "$listeners" >&2
+    die "请先处理端口冲突,再重新执行。"
+  fi
+}
+
+# 域名变更/安装前的 DNS 检查:必须能解析;尽力比对本机地址,不匹配时要求确认
+check_domain_dns() {
+  local domain=$1 force=$2
+  local resolved
+  resolved=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)
+
+  if [[ -z $resolved ]]; then
+    if [[ $force -eq 1 ]]; then
+      warn "域名 $domain 当前解析不到 IPv4,--force 跳过检查。"
+      return 0
+    fi
+    die "域名 $domain 当前解析不到 IPv4。请先添加 DNS A 记录并等待生效;确认无误可加 --force 跳过。"
+  fi
+
+  local local_ips match=0 ip
+  local_ips=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | sort -u || true)
+  for ip in $resolved; do
+    if grep -qx "$ip" <<<"$local_ips"; then
+      match=1
+    fi
+  done
+
+  if [[ $match -eq 0 && $force -ne 1 ]]; then
+    warn "域名 $domain 解析到:$(tr '\n' ' ' <<<"$resolved")"
+    warn "本机网卡上未发现这些地址(NAT/云环境下可能属正常)。"
+    [[ -t 0 ]] || die "无法交互确认。确认 DNS 指向本机后,加 --force 重试。"
+    local answer
+    read -r -p "确认继续?[y/N]:" answer
+    case "${answer,,}" in
+      y|yes) ;;
+      *) die "已取消。" ;;
+    esac
+  fi
+}
+
+# ---------------- 备份 ----------------
+
+# 执行备份;stdout 只输出归档路径,过程信息一律走 stderr。
+# 必须通过命令替换调用(archive=$(run_backup ...)):内部 EXIT 陷阱依赖子 shell 隔离。
+run_backup() {
+  local mode=$1 keep_days=$2 backup_dir=$3
+  install -d -m 0700 "$backup_dir"
+
+  local ts stage archive archive_tmp stopped=0
+  ts=$(date '+%Y%m%d-%H%M%S')
+  stage=$(mktemp -d "$backup_dir/.staging-${ts}-XXXXXX")
+  archive="$backup_dir/vaultwarden-backup-${ts}-${mode}.tar.gz"
+  archive_tmp="${archive}.tmp"
+
+  # shellcheck disable=SC2154  # rc 在陷阱触发时先行赋值
+  trap 'rc=$?; rm -rf "$stage" "$archive_tmp"
+        [[ ${stopped:-0} -eq 1 ]] && { compose start vaultwarden >/dev/null || true; }
+        exit "$rc"' EXIT INT TERM
+
+  install -d -m 0700 "$stage/vw-data" "$stage/deployment"
+
+  if [[ $mode == "cold" ]]; then
+    if docker inspect -f '{{.State.Running}}' vaultwarden 2>/dev/null | grep -qx true; then
+      compose stop vaultwarden >/dev/null
+      stopped=1
+    fi
+    cp -a "$DATA_DIR"/. "$stage/vw-data"/
+  else
+    cp -a "$DATA_DIR"/. "$stage/vw-data"/
+    rm -f "$stage/vw-data/db.sqlite3" "$stage/vw-data/db.sqlite3-wal" "$stage/vw-data/db.sqlite3-shm"
+    if [[ -f $DATA_DIR/db.sqlite3 ]]; then
+      sqlite3 "$DATA_DIR/db.sqlite3" ".backup '$stage/vw-data/db.sqlite3'"
+    fi
+  fi
+
+  cp -a "$ENV_FILE" "$COMPOSE_FILE" "$CADDYFILE" "$stage/deployment"/
+
+  {
+    echo "created_at=$(date --iso-8601=seconds)"
+    echo "backup_mode=$mode"
+    echo "vaultwardenctl_version=$VERSION"
+    echo "hostname=$(hostname -f 2>/dev/null || hostname)"
+    docker inspect -f 'vaultwarden_image={{.Config.Image}} image_id={{.Image}}' vaultwarden 2>/dev/null || true
+    docker inspect -f 'caddy_image={{.Config.Image}} image_id={{.Image}}' vaultwarden-caddy 2>/dev/null || true
+  } > "$stage/metadata.txt"
+
+  if [[ -f $stage/vw-data/db.sqlite3 ]]; then
+    local integrity
+    integrity=$(sqlite3 "$stage/vw-data/db.sqlite3" 'PRAGMA integrity_check;')
+    [[ $integrity == "ok" ]] || die "备份数据库完整性检查失败:$integrity"
+  fi
+
+  tar --numeric-owner -C "$stage" -czf "$archive_tmp" .
+  chmod 0600 "$archive_tmp"
+  mv "$archive_tmp" "$archive"
+
+  if [[ $stopped -eq 1 ]]; then
+    compose start vaultwarden >/dev/null
+    stopped=0
+  fi
+
+  find "$backup_dir" -maxdepth 1 -type f -name 'vaultwarden-backup-*.tar.gz' \
+    -mtime "+${keep_days}" -delete
+
+  trap - EXIT INT TERM
+  rm -rf "$stage"
+  echo "$archive"
+}
+
+cmd_backup() {
+  require_root
+  require_deployment
+
+  local mode="online" keep_days=14 backup_dir="$BACKUP_DIR"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --online) mode="online"; shift ;;
+      --cold) mode="cold"; shift ;;
+      --keep)
+        [[ $# -ge 2 ]] || die "--keep 缺少天数。"
+        keep_days=$2; shift 2 ;;
+      --output)
+        [[ $# -ge 2 ]] || die "--output 缺少目录。"
+        backup_dir=$2; shift 2 ;;
+      -h|--help)
+        echo "用法:vaultwardenctl backup [--online|--cold] [--keep 天数] [--output 目录]"
+        echo "  --online  SQLite 在线备份,基本无停机(默认)"
+        echo "  --cold    短暂停止 Vaultwarden 后完整复制,适合更新/维护前"
+        return 0 ;;
+      *) die "backup 不支持参数:$1" ;;
+    esac
+  done
+  [[ $keep_days =~ ^[0-9]+$ ]] || die "--keep 必须是非负整数。"
+
+  acquire_lock
+  local archive
+  archive=$(run_backup "$mode" "$keep_days" "$backup_dir")
+  echo "$archive"
+}
+
+# ---------------- 恢复 ----------------
+
+cmd_restore() {
+  require_root
+  [[ ${1:-} != "-h" && ${1:-} != "--help" ]] || {
+    echo "用法:vaultwardenctl restore <备份.tar.gz>"
+    echo "只恢复 vw-data 数据,不恢复域名、Compose 和 Caddy 配置;恢复前会再做一次冷备份。"
+    return 0
+  }
+  [[ $# -eq 1 ]] || die "用法:vaultwardenctl restore <备份.tar.gz>"
+
+  local archive=$1
+  [[ -f $archive ]] || die "备份文件不存在:$archive"
+  archive=$(readlink -f "$archive")
+  require_deployment
+  acquire_lock
+
+  echo "将使用以下备份覆盖当前 Vaultwarden 数据:"
+  echo "  $archive"
+  [[ -t 0 ]] || die "restore 需要交互确认,请在终端中执行。"
+  local confirm
+  read -r -p "请输入 RESTORE 继续:" confirm
+  if [[ $confirm != "RESTORE" ]]; then
+    echo "已取消。"
+    return 0
+  fi
+
+  local url safety
+  url=$(vw_url)
+  safety=$(run_backup cold 30 "$BACKUP_DIR")
+  echo "恢复前安全备份:$safety"
+
+  local tmp
+  tmp=$(mktemp -d "$BACKUP_DIR/.restore-XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT
+  tar -xzf "$archive" -C "$tmp"
+
+  [[ -f $tmp/vw-data/db.sqlite3 ]] || die "备份中缺少 vw-data/db.sqlite3。"
+  [[ $(sqlite3 "$tmp/vw-data/db.sqlite3" 'PRAGMA integrity_check;') == "ok" ]] \
+    || die "备份数据库完整性检查失败。"
+
+  local ts old_dir new_dir
+  ts=$(date '+%Y%m%d-%H%M%S')
+  old_dir="$APP_DIR/vw-data.before-restore-$ts"
+  new_dir="$APP_DIR/vw-data.restore-new-$ts"
+
+  cp -a "$tmp/vw-data" "$new_dir"
+  compose stop vaultwarden
+  mv "$DATA_DIR" "$old_dir"
+  mv "$new_dir" "$DATA_DIR"
+  compose up -d vaultwarden
+
+  if wait_alive "$url"; then
+    rm -rf "$tmp"
+    trap - EXIT
+    echo "恢复完成。恢复前数据目录保留在:$old_dir"
+    return 0
+  fi
+
+  echo "错误:恢复后的服务未通过健康检查,正在还原原数据目录。" >&2
+  compose stop vaultwarden || true
+  mv "$DATA_DIR" "$APP_DIR/vw-data.failed-restore-$ts"
+  mv "$old_dir" "$DATA_DIR"
+  compose up -d vaultwarden
+  exit 1
+}
+
+# ---------------- 配置管理 ----------------
+
+config_show() {
+  local key env_key
+  echo "访问地址:$(vw_url)"
+  for key in "${CFG_ORDER[@]}"; do
+    env_key=${CFG_ENV[$key]}
+    printf '%-9s %s=%s\n' "$key" "$env_key" "$(get_env "$env_key")"
+  done
+  if [[ -f $CONFIG_JSON ]]; then
+    echo "提示:存在 vw-data/config.json;config set 会移除其中对受管参数的覆盖,保证 .env 是唯一来源。"
+  fi
+}
+
+# 回滚一次失败的 config set:还原快照并重建相关服务
+config_rollback() {
+  local snap_env=$1 snap_json=$2 old_url=$3
+  shift 3
+  local services=("$@")
+
+  warn "正在回滚配置……"
+  cp -a "$snap_env" "$ENV_FILE"
+  if [[ -n $snap_json && -f $snap_json ]]; then
+    cp -a "$snap_json" "$CONFIG_JSON"
+  fi
+  compose up -d --no-deps --force-recreate "${services[@]}" || true
+  if wait_alive "$old_url"; then
+    warn "已回滚到修改前配置,服务恢复正常。"
+  else
+    warn "回滚后服务仍未通过健康检查,请立即执行 vaultwardenctl status 检查。"
+  fi
+}
+
+config_set() {
+  local force=0 key
+  local -A new=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      -h|--help)
+        echo "用法:vaultwardenctl config set <键> <值> [<键> <值>...] [--force]"
+        echo "可用键:${CFG_ORDER[*]}"
+        return 0 ;;
+      *)
+        key=$1
+        [[ -n ${CFG_ENV[$key]:-} ]] || die "未知配置键:$key(可用:${CFG_ORDER[*]})"
+        [[ $# -ge 2 ]] || die "配置键 $key 缺少值。"
+        local value
+        value=$(validate_value "$key" "$2") || die "$key 的值无效:$2"
+        new[$key]=$value
+        shift 2 ;;
+    esac
+  done
+  [[ ${#new[@]} -gt 0 ]] || die "没有指定要修改的配置。示例:vaultwardenctl config set signups off"
+
+  # 过滤无变化项,changed 按注册表顺序排列
+  local -a changed=()
+  for key in "${CFG_ORDER[@]}"; do
+    if [[ -z ${new[$key]:-} ]]; then
+      continue
+    fi
+    if [[ ${new[$key]} == "$(get_env "${CFG_ENV[$key]}")" ]]; then
+      info "$key 已经是 ${new[$key]},跳过。"
+      unset "new[$key]"
+    else
+      changed+=("$key")
+    fi
+  done
+  if [[ ${#changed[@]} -eq 0 ]]; then
+    echo "没有需要应用的修改。"
+    return 0
+  fi
+
+  local old_url domain_changed=0
+  old_url=$(vw_url)
+  if [[ -n ${new[domain]:-} ]]; then
+    domain_changed=1
+    check_domain_dns "${new[domain]}" "$force"
+  fi
+
+  acquire_lock
+
+  local ts snap_env snap_json=""
+  ts=$(date '+%Y%m%d-%H%M%S')
+  install -d -m 0700 "$BACKUP_DIR"
+  snap_env="$BACKUP_DIR/env-before-config-$ts"
+  cp -a "$ENV_FILE" "$snap_env"
+
+  if [[ $domain_changed -eq 1 ]]; then
+    info "域名变更前先做一次在线备份……"
+    local pre_backup
+    pre_backup=$(run_backup online 14 "$BACKUP_DIR")
+    info "备份:$pre_backup"
+  fi
+
+  for key in "${changed[@]}"; do
+    set_env "${CFG_ENV[$key]}" "${new[$key]}"
+  done
+
+  # 清除 config.json 中对受管参数的覆盖(管理后台保存的配置会覆盖环境变量)
+  if [[ -f $CONFIG_JSON ]]; then
+    local field
+    local -a json_fields=()
+    for key in "${changed[@]}"; do
+      if [[ -n ${CFG_JSON_KEY[$key]:-} ]]; then
+        json_fields+=("${CFG_JSON_KEY[$key]}")
+      fi
+    done
+    if [[ ${#json_fields[@]} -gt 0 ]]; then
+      snap_json="$BACKUP_DIR/config-json-before-config-$ts.json"
+      cp -a "$CONFIG_JSON" "$snap_json"
+      for field in "${json_fields[@]}"; do
+        jq "del(.${field})" "$CONFIG_JSON" > "${CONFIG_JSON}.tmp"
+        install -m 0600 "${CONFIG_JSON}.tmp" "$CONFIG_JSON"
+        rm -f "${CONFIG_JSON}.tmp"
+      done
+    fi
+  fi
+
+  # 汇总需要重建的服务
+  local svc
+  local -A svc_set=()
+  for key in "${changed[@]}"; do
+    for svc in ${CFG_SVCS[$key]}; do
+      svc_set[$svc]=1
+    done
+  done
+  local -a services=("${!svc_set[@]}")
+
+  if ! compose config --quiet; then
+    config_rollback "$snap_env" "$snap_json" "$old_url" "${services[@]}"
+    die "Compose 配置校验失败,已回滚。"
+  fi
+
+  info "重建服务:${services[*]}"
+  if ! compose up -d --no-deps --force-recreate "${services[@]}"; then
+    config_rollback "$snap_env" "$snap_json" "$old_url" "${services[@]}"
+    die "服务重建失败,已回滚。"
+  fi
+
+  local new_url attempts=30
+  new_url=$(vw_url)
+  if [[ $domain_changed -eq 1 ]]; then
+    attempts=90
+    info "等待 Caddy 为新域名签发证书(最长约 $((attempts * 2)) 秒)……"
+  fi
+  if ! wait_alive "$new_url" "$attempts"; then
+    warn "${new_url}/alive 健康检查失败。"
+    config_rollback "$snap_env" "$snap_json" "$old_url" "${services[@]}"
+    die "配置修改未通过健康检查,已回滚。修改前配置快照:$snap_env"
+  fi
+
+  echo
+  config_show
+  echo "配置已应用,服务正常。"
+
+  if [[ $domain_changed -eq 1 ]]; then
+    echo
+    echo "域名已切换为:$new_url。注意:"
+    echo "  1. 所有 Bitwarden 客户端(桌面/移动/浏览器扩展)需把服务器地址改为新域名,部分客户端需先注销再重新登录;"
+    echo "  2. 旧域名的 DNS 记录建议保留一两天,确认一切正常后再删除;"
+    echo "  3. 修改前配置快照:$snap_env"
+  fi
+  if [[ $(get_env SIGNUPS_ALLOWED) == "false" ]]; then
+    echo "注册已在服务端关闭;网页或客户端可能缓存 /api/config,界面变化不一定立即可见。"
+  fi
+  if [[ $(get_env WEB_VAULT_ENABLED) == "false" ]]; then
+    echo "网页端已关闭,但桌面端、移动端和浏览器扩展仍可通过 API 同步。"
+  fi
+}
+
+cmd_config() {
+  require_root
+  require_deployment
+  local sub=${1:-show}
+  if [[ $# -gt 0 ]]; then
+    shift
+  fi
+  case "$sub" in
+    show) config_show ;;
+    set) config_set "$@" ;;
+    -h|--help|help)
+      echo "用法:vaultwardenctl config show"
+      echo "      vaultwardenctl config set <键> <值> [<键> <值>...] [--force]"
+      echo "可用键:${CFG_ORDER[*]}" ;;
+    *) die "config 只支持 show / set 子命令。" ;;
+  esac
+}
+
+# ---------------- 更新 ----------------
+
+cmd_update() {
+  require_root
+  require_deployment
+  acquire_lock
+
+  compose config --quiet
+  local url old_vw old_caddy backup_file
+  url=$(vw_url)
+  old_vw=$(docker inspect -f '{{.Image}}' vaultwarden)
+  old_caddy=$(docker inspect -f '{{.Image}}' vaultwarden-caddy)
+
+  info "先执行一致性冷备份……"
+  backup_file=$(run_backup cold 14 "$BACKUP_DIR")
+  info "备份:$backup_file"
+
+  info "拉取新镜像并重建容器……"
+  compose pull
+  compose up -d --remove-orphans
+
+  if wait_alive "$url"; then
+    echo "更新完成。"
+    compose ps
+    docker inspect -f 'Vaultwarden: {{.Config.Image}}  {{.Image}}' vaultwarden
+    docker inspect -f 'Caddy:       {{.Config.Image}}  {{.Image}}' vaultwarden-caddy
+    echo "未自动清理旧镜像,以便必要时回滚。"
+    return 0
+  fi
+
+  echo "错误:新版本健康检查失败,开始回滚镜像……" >&2
+  compose logs --tail=100 vaultwarden caddy >&2 || true
+
+  docker tag "$old_vw" "$VW_IMAGE"
+  docker tag "$old_caddy" "$CADDY_IMAGE"
+  compose up -d --force-recreate --remove-orphans
+
+  if wait_alive "$url"; then
+    echo "已回滚到更新前镜像。更新前备份:$backup_file" >&2
+  else
+    echo "严重错误:镜像回滚后服务仍未恢复。请执行 vaultwardenctl status,并保留备份:$backup_file" >&2
+  fi
+  exit 1
+}
+
+# ---------------- 状态与日志 ----------------
+
+cmd_status() {
+  require_root
+  require_deployment
+
+  local host url
+  host=$(get_env VW_HOST)
+  url="https://$host"
+
+  echo "== 容器状态 =="
+  compose ps
+  echo
+
+  echo "== 关键配置 =="
+  config_show
+  echo
+
+  echo "== 服务检测 =="
+  if curl -fsS --max-time 10 "${url}/alive"; then
+    echo
+    echo "HTTPS /alive:正常"
+  else
+    echo "HTTPS /alive:失败"
+  fi
+  echo
+
+  echo "== 镜像 =="
+  docker inspect -f 'Vaultwarden: {{.Config.Image}}  {{.Image}}' vaultwarden 2>/dev/null || true
+  docker inspect -f 'Caddy:       {{.Config.Image}}  {{.Image}}' vaultwarden-caddy 2>/dev/null || true
+  echo
+
+  echo "== TLS 证书 =="
+  timeout 12 openssl s_client -servername "$host" -connect "$host:443" </dev/null 2>/dev/null \
+    | openssl x509 -noout -subject -issuer -dates 2>/dev/null || echo "无法读取证书。"
+  echo
+
+  echo "== 备份定时器 =="
+  systemctl list-timers vaultwarden-backup.timer --no-pager 2>/dev/null || echo "未发现备份定时器。"
+  echo
+
+  echo "== 最近日志 =="
+  compose logs --tail=30 vaultwarden caddy
+}
+
+cmd_logs() {
+  require_root
+  require_deployment
+
+  local tail=100
+  local -a args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--follow) args+=(-f); shift ;;
+      -n|--tail)
+        [[ $# -ge 2 ]] || die "--tail 缺少行数。"
+        tail=$2; shift 2 ;;
+      -h|--help)
+        echo "用法:vaultwardenctl logs [-f] [--tail N] [服务名...](服务名:vaultwarden caddy)"
+        return 0 ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  compose logs --tail="$tail" "${args[@]}"
+}
+
+# ---------------- 首次安装 ----------------
+
+cmd_install() {
+  require_root
+
+  if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+    echo "用法:vaultwardenctl install <域名> <ACME邮箱>"
+    echo "示例:vaultwardenctl install vault.example.com admin@example.com"
+    echo "前提:Debian 12/13;域名 A 记录已指向本机;防火墙已放行 TCP 80/443(可选 UDP 443)。"
+    return 0
+  fi
+
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+  else
+    die "无法识别操作系统。"
+  fi
+  [[ ${ID:-} == "debian" ]] || die "install 只支持 Debian 12/13,当前系统 ID=${ID:-unknown}。"
+
+  local domain=${1:-} email=${2:-}
+  if [[ -z $domain ]]; then
+    read -r -p "Vaultwarden 域名(例如 vault.example.com):" domain
+  fi
+  if [[ -z $email ]]; then
+    read -r -p "用于证书签发通知的邮箱:" email
+  fi
+
+  domain=$(strip_domain "$domain")
+  validate_domain_format "$domain" || die "域名格式无效:$domain"
+  validate_email_format "$email" || die "邮箱格式无效:$email"
+
+  if [[ -e $APP_DIR ]]; then
+    die "$APP_DIR 已存在。为避免覆盖现有数据,安装已停止。"
+  fi
+
+  if ! getent ahostsv4 "$domain" >/dev/null 2>&1; then
+    warn "域名 $domain 当前解析不到 IPv4;继续安装,但证书签发可能失败,请尽快检查 DNS。"
+  fi
+
+  acquire_lock
+  install_docker
+  check_ports
+
+  umask 077
+  install -d -m 0700 "$APP_DIR" "$DATA_DIR" "$APP_DIR/caddy-data" \
+    "$APP_DIR/caddy-config" "$BACKUP_DIR"
+
+  write_env_file "$domain" "$email"
+  write_compose_file
+  write_caddyfile
+
+  compose config --quiet
+  compose pull
+  caddy_validate
+  compose up -d
+
+  install_self
+  install_backup_timer
+
+  echo
+  echo "等待 HTTPS 与 Vaultwarden 就绪……"
+  local ready=0
+  if wait_alive "https://$domain" 90; then
+    ready=1
+  fi
+
+  echo
+  compose ps
+  echo
+  if [[ $ready -eq 1 ]]; then
+    echo "部署完成:https://$domain"
+    echo "现在先打开网页创建唯一账户,然后立即执行:"
+    echo "  sudo vaultwardenctl config set signups off"
+  else
+    echo "容器已启动,但 HTTPS 尚未通过检测。常见原因是 DNS 未生效、80/443 未放行或被上游拦截。"
+    echo "检查命令:"
+    echo "  sudo vaultwardenctl status"
+    echo "  sudo vaultwardenctl logs --tail 100"
+  fi
+
+  echo
+  echo "每日本地备份定时器已启用:"
+  systemctl list-timers vaultwarden-backup.timer --no-pager || true
+  echo "注意:同机备份不能代替异地加密备份。"
+}
+
+# ---------------- 入口 ----------------
+
+usage() {
+  cat <<USAGE
+vaultwardenctl ${VERSION} — Vaultwarden 部署与运维统一入口
+
+用法:sudo vaultwardenctl <子命令> [参数]
+
+部署:
+  install <域名> <邮箱>    首次安装(Debian 12/13;无参则交互输入)
+
+配置(单一来源:${ENV_FILE}):
+  config show              查看当前配置
+  config set <键 值>...    修改配置,可一次改多项;校验失败或健康检查失败自动回滚
+      键:domain(域名) email(证书邮箱) web(网页端 on/off) signups(注册 on/off)
+      示例:
+        vaultwardenctl config set signups off
+        vaultwardenctl config set web on signups off
+        vaultwardenctl config set domain vault.example.com
+
+运维:
+  status                   容器/配置/HTTPS/证书/备份定时器/日志总览
+  update                   一键更新(先冷备份;健康检查失败自动回滚镜像)
+  backup [--online|--cold] [--keep 天数] [--output 目录]
+  restore <备份.tar.gz>    恢复数据(需输入 RESTORE 确认)
+  logs [-f] [--tail N] [服务名...]
+
+其他:
+  version                  显示版本
+  help                     显示本帮助
+USAGE
+}
+
+main() {
+  local cmd=${1:-help}
+  if [[ $# -gt 0 ]]; then
+    shift
+  fi
+  case "$cmd" in
+    install) cmd_install "$@" ;;
+    config)  cmd_config "$@" ;;
+    status)  cmd_status "$@" ;;
+    update)  cmd_update "$@" ;;
+    backup)  cmd_backup "$@" ;;
+    restore) cmd_restore "$@" ;;
+    logs)    cmd_logs "$@" ;;
+    version|--version|-V) echo "vaultwardenctl $VERSION" ;;
+    help|-h|--help) usage ;;
+    *)
+      usage >&2
+      die "未知子命令:$cmd"
+      ;;
+  esac
+}
+
+# 允许 source 本文件做函数级测试
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
